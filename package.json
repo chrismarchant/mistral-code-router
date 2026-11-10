@@ -1,0 +1,9 @@
+{
+  "name": "mistral-code-router",
+  "private": true,
+  "description": "Claude Code plugin: zero-dependency MCP server routing workstreams to Mistral-hosted models.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test mcp-server/test/*.test.js"
+  }
+}
