@@ -1,0 +1,16 @@
+{
+  "name": "mistral-code-router",
+  "owner": {
+    "name": "Christopher Marchant",
+    "github": "chrismarchant"
+  },
+  "description": "Claude Code plugin marketplace hosting the mistral-router plugin: parallel workstreams offloaded to Mistral-hosted models (Mistral Large 4, Z.ai GLM 5.3, DeepSeek V4.1 Flash), live + batch.",
+  "plugins": [
+    {
+      "name": "mistral-router",
+      "source": "./",
+      "description": "Routes parallel Claude Code workstreams to Mistral-hosted models via a bundled zero-dependency MCP server.",
+      "version": "0.1.0"
+    }
+  ]
+}

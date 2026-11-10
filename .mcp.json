@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mistral-router": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/server.js"],
+      "env": {
+        "MISTRAL_API_KEY": "${MISTRAL_API_KEY}",
+        "MISTRAL_API_BASE": "${MISTRAL_API_BASE:-https://api.mistral.ai/v1}",
+        "MAX_CONTEXT_CHARS": "${MAX_CONTEXT_CHARS:-200000}"
+      }
+    }
+  }
+}
