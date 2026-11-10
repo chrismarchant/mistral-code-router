@@ -94,8 +94,9 @@ For many non-interactive workstreams, use `/parallel --batch <task>` or the batc
 tools directly (see https://docs.mistral.ai/inference/batch-processing):
 
 - `mistral_batch_submit({ model: "glm-flash", requests: [{ custom_id: "ws-0", task: "...", files: ["src/a.ts"], json: true }] })` → uploads a JSONL input file (`POST /v1/files`, purpose `batch`) and creates a job (`POST /v1/batch/jobs`, endpoint `/v1/chat/completions`) → returns `job_id`.
-- `mistral_batch_status({ job_id })` — poll until `SUCCESS` / `FAILED`.
-- `mistral_batch_results({ job_id })` — downloads the output file and returns `[{custom_id, status_code, content, usage, error}]`.
+  The job is created with `input_files: [file_id]` and `timeout_hours` (from `completion_window`, `"1h"`–`"168h"`, default `"24h"`). All requests are validated (non-empty, unique `custom_id`, non-empty `task`, valid `temperature`, sandboxed `files`) before any network call.
+- `mistral_batch_status({ job_id })` — poll until `router.terminal` is true (`SUCCESS`, `FAILED`, `TIMEOUT_EXCEEDED`, `CANCELLED`).
+- `mistral_batch_results({ job_id })` — downloads the output file (and error file, if any) and returns `{status, terminal, ok, results: [{custom_id, status_code, content, usage, error}], errors}`. Non-terminal jobs return empty results with a note; failed, cancelled or expired jobs return whatever partial output and errors exist.
 
 Batch is asynchronous (default completion window 24h) and cheaper, but the remote
 model cannot use tools in batch mode — use it for test/doc generation, per-file
@@ -118,8 +119,76 @@ accepted as `model`.
 | Var | Default | Description |
 |---|---|---|
 | `MISTRAL_API_KEY` | — | required |
-| `MISTRAL_API_BASE` | `https://api.mistral.ai/v1` | override endpoint |
-| `MAX_CONTEXT_CHARS` | `200000` | cap on file context sent per delegate call |
+| `MISTRAL_API_BASE` | `https://api.mistral.ai/v1` | endpoint; must be `https://api.mistral.ai/...` unless custom bases are allowed |
+| `MISTRAL_ROUTER_ALLOW_CUSTOM_BASE` | unset | set to `1` to allow any http(s) `MISTRAL_API_BASE` |
+| `MAX_CONTEXT_CHARS` | `200000` | cap on total file context characters per request |
+| `MISTRAL_ROUTER_ALLOWED_ROOTS` | unset | extra workspace roots for `files`, separated by `:` (`;` on Windows) |
+| `MISTRAL_ROUTER_MAX_FILE_BYTES` | `524288` | per-file size cap (512 KiB), checked before reading |
+| `MISTRAL_ROUTER_MAX_FILES` | `50` | maximum number of entries in `files` |
+
+## Security
+
+The `files` parameter reads local files and sends their contents to the API, so
+it is sandboxed and **fails closed**: if any requested path is rejected, the
+whole call fails before any request is sent. The error names each path as given
+and the reason (`outside_root`, `symlink_escape`, `sensitive`,
+`not_regular_file`, `too_large`, `not_found`, or `too_many_files`); file
+contents are never included in errors.
+
+- **Approved roots.** The server's working directory, plus any directories in
+  `MISTRAL_ROUTER_ALLOWED_ROOTS`. Roots are canonicalised (`realpath`) at
+  startup; entries that do not exist are ignored with a warning on stderr.
+- **Canonical resolution.** Every path is resolved with `realpath` (symlinks
+  followed) and must land inside an approved root (`path.relative`
+  containment, so `/x/root-evil` is not inside `/x/root`). A symlink inside a
+  root that points outside is rejected as `symlink_escape`. Only regular files
+  are read: no directories, devices, FIFOs, globbing or traversal.
+- **Sensitive exclusions** (on the canonical path and on the path as requested,
+  even inside a root): `.env` and `.env.*` (except `.env.example`,
+  `.env.sample`, `.env.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`,
+  `*.keystore`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519` (and `.pub`),
+  anything under `.ssh/`, `.aws/`, `.gnupg/`, `.git/`, `.kube/`,
+  `.docker/config.json`, `.netrc`, `.npmrc`, `.pypirc`, `credentials`,
+  `credentials.json`, `secrets.*`, `*.tfstate`, `*.tfvars`,
+  `settings.local.json` (anywhere, including `.claude/`), `.claude.json`.
+  Files whose content contains a PEM private-key header
+  (`-----BEGIN ... PRIVATE KEY-----`) are also refused.
+- **Limits.** Per-file byte cap (checked via `stat` before reading), file-count
+  cap, and the total `MAX_CONTEXT_CHARS` cap (later files are truncated or
+  marked `omitted`).
+- **Base-URL allowlist.** The bearer key is only sent to
+  `https://api.mistral.ai`. Any other `MISTRAL_API_BASE` makes every API tool
+  call fail with a clear error unless `MISTRAL_ROUTER_ALLOW_CUSTOM_BASE=1`.
+  API error bodies are truncated in tool errors; the key is never logged.
+
+### Batch billing (HTTP 402)
+
+An HTTP 402 from any endpoint (commonly `POST /v1/batch/jobs`) is reported as
+an account-level billing blocker, not a software fault. Do not retry; resolve
+billing or credits for the key in the Mistral console first.
+
+### Model parameters
+
+- `temperature` must be a finite number in `[0, 2]`.
+- `mistral-large-4-0` (`lechonk`) rejects greedy sampling unless `top_p` is 1,
+  so `temperature: 0` automatically sends `top_p: 1` for that model. Rules live
+  in `MODEL_PARAM_POLICIES` in `server.js`; other models and raw IDs pass
+  parameters through unchanged.
+- GLM and Large 4 can return `message.content` as blocks (`thinking` then
+  `text`). Tool results return only the concatenated `text` blocks as a string.
+
+### Proxy in sandboxed cloud sessions
+
+Node's built-in `fetch` ignores `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY=1`
+(Node 22.21+ / 24.5+). In a cloud session that routes egress through a proxy,
+export `NODE_USE_ENV_PROXY=1` in the session environment so the MCP server
+process inherits it.
+
+## Tests
+
+```bash
+npm test   # node --test mcp-server/test/*.test.js — no dependencies, no network
+```
 
 ## Notes / guardrails
 
