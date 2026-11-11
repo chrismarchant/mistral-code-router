@@ -116,8 +116,8 @@ test('symlink with innocent name pointing to a sensitive file inside root is rej
 
 test('PEM private key content is rejected without leaking content', () => {
   const { root, cfg } = setup();
-  write(path.join(root, 'notes.md'), 'intro\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAASECRETMATERIAL\n-----END OPENSSH PRIVATE KEY-----\n');
-  write(path.join(root, 'rsa.txt'), '-----BEGIN RSA PRIVATE KEY-----\nzzz\n');
+  write(path.join(root, 'notes.md'), 'intro\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAASECRETMATERIAL' + 'b3BlbnNzaC1rZXk'.repeat(4) + '\n-----END OPENSSH PRIVATE KEY-----\n');
+  write(path.join(root, 'rsa.txt'), '-----BEGIN RSA PRIVATE KEY-----\n' + 'MIIE'.repeat(16) + '\n');
   assert.throws(() => readFileContext(['notes.md'], cfg), (err) => {
     assert.match(err.message, /"notes\.md" -> sensitive \(contains a PEM\/PGP private key\)/);
     assert.ok(!err.message.includes('SECRETMATERIAL'));

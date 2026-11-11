@@ -123,7 +123,7 @@ accepted as `model`.
 | `MISTRAL_ROUTER_ALLOW_CUSTOM_BASE` | unset | set to `1` to allow any http(s) `MISTRAL_API_BASE` |
 | `MAX_CONTEXT_CHARS` | `200000` | cap on total file context characters per request |
 | `MISTRAL_ROUTER_ALLOWED_ROOTS` | unset | extra workspace roots for `files`, separated by `:` (`;` on Windows) |
-| `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT` | unset | set to `1` to allow `/` or the home directory itself as a root |
+| `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT` | unset | set to `1` to allow `/`, the home directory or a parent of it as a root |
 | `MISTRAL_ROUTER_MAX_FILE_BYTES` | `524288` | per-file size cap (512 KiB), checked before reading |
 | `MISTRAL_ROUTER_MAX_FILES` | `50` | maximum number of entries in `files` |
 
@@ -134,19 +134,30 @@ it is sandboxed and **fails closed**: if any requested path is rejected, the
 whole call fails before any request is sent. The error names each path as given
 and the reason (`outside_root`, `symlink_escape`, `sensitive`,
 `not_regular_file`, `hard_link`, `too_large`, `not_found`,
-`changed_during_read`, `too_many_files`, or `unsafe_root`); file contents are
+`changed_during_read`, `unsafe_path`, `too_many_files`, or `unsafe_root`); file contents are
 never included in errors.
 
 - **Approved roots.** The server's working directory, plus any directories in
   `MISTRAL_ROUTER_ALLOWED_ROOTS`. Roots are canonicalised (`realpath`) at
   startup; entries that do not exist are ignored with a warning on stderr.
-- **Unsafe roots.** The filesystem root `/`, the home directory itself, and
-  anything equal to or under `/proc`, `/sys` or `/dev` are never approved. If
-  the working directory is one of these, every call that passes `files` fails
-  with `unsafe_root`; other tools and inline `context` keep working. An unsafe
-  entry in `MISTRAL_ROUTER_ALLOWED_ROOTS` is ignored. Subdirectories of home
-  are fine. `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT=1` opts in `/` and the home
-  directory only; `/proc`, `/sys` and `/dev` cannot be opted in.
+- **Unsafe roots.** These are refused as roots, whether they are the working
+  directory or an entry in `MISTRAL_ROUTER_ALLOWED_ROOTS`:
+  - the filesystem root `/`, the home directory itself, and any directory
+    that contains the home directory (for example `/home`);
+  - `/etc`, `/root`, `/boot`, `/proc`, `/sys`, `/dev` and everything under
+    them;
+  - `/var`, `/usr`, `/opt`, `/srv`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/run`
+    themselves (a project strictly under them, such as `/var/www/app` or
+    `/opt/project`, is fine).
+
+  If the working directory is refused, every call that passes `files` fails
+  with `unsafe_root`; other tools and inline `context` keep working. A refused
+  extra root is ignored. Subdirectories of home and `/tmp` are fine.
+  `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT=1` opts in only `/`, the home directory
+  and a parent of the home directory; the system directories can never be
+  opted in.
+- **Pseudo-filesystems.** A file whose real path is under `/proc`, `/sys` or
+  `/dev` is always rejected (`unsafe_path`), even with the opt-in above.
 - **Canonical resolution.** Every path is resolved with `realpath` (symlinks
   followed) and must land inside an approved root (`path.relative`
   containment, so `/x/root-evil` is not inside `/x/root`). A symlink inside a
@@ -158,9 +169,10 @@ never included in errors.
   hard-linked files (some package-manager stores) must be passed as inline
   `context` instead.
 - **Read-time verification.** After opening, the file's device and inode must
-  match what was checked, and on Linux the open descriptor's real path
-  (`/proc/self/fd`) must still be inside an approved root; otherwise the read
-  is rejected as `changed_during_read`.
+  match what was checked; the requested path is resolved again and must still
+  lead to that same file inside an approved root; and on Linux the open
+  descriptor's real path (`/proc/self/fd`) must be inside an approved root.
+  Otherwise the read is rejected as `changed_during_read`.
 - **Sensitive names** (matched case-insensitively on the canonical path and on
   the path as requested, even inside a root):
   - environment files: `.env*` (`.env`, `.env.local`, `.envrc`, `.env~`,
@@ -182,13 +194,14 @@ never included in errors.
   - Claude settings: `settings.local.json` (anywhere), `.claude.json`;
   - shell and REPL history: `*_history` (`.bash_history`, `.zsh_history`,
     `.python_history`), `.histfile`, `.lesshst`, `.viminfo`.
-- **Sensitive content.** A file is refused if it contains a PEM or PGP
-  private-key header (`-----BEGIN ... PRIVATE KEY-----`, with or without
-  `BLOCK`, including UTF-16 encodings), a PuTTY key header
-  (`PuTTY-User-Key-File-`), an `aws_secret_access_key` assignment with a
-  40-character value, or an AWS access key id (`AKIA` + 16 characters). These
-  checks are a backstop, not a general secret scanner: do not rely on them to
-  catch arbitrary tokens.
+- **Sensitive content.** A file is refused if it contains key material: a PEM
+  or PGP private-key header followed shortly by a run of 40 or more base64
+  characters (including UTF-16 encodings), a PuTTY key file that has a
+  `Private-Lines` field, an `aws_secret_access_key` assignment with a
+  40-character value, or an AWS access key id (`AKIA` + 16 characters). Files
+  that only mention the PEM or PuTTY markers are allowed. These checks are a
+  backstop, not a general secret scanner: do not rely on them to catch
+  arbitrary tokens.
 - **Delimiters.** File contents are wrapped in a per-call random tag
   (`<file-<12 hex> path="...">`), so file content cannot forge a closing tag.
 - **Limits.** Per-file byte cap (checked via `stat` before reading), file-count
@@ -207,8 +220,10 @@ An HTTP 402 from any endpoint (commonly `POST /v1/batch/jobs`) is reported as
 an account-level billing blocker, not a software fault. Do not retry; resolve
 billing or credits for the key in the Mistral console first.
 
-If creating the job fails after the input file was uploaded, the server tries
-to delete the uploaded file and the error says whether that cleanup succeeded.
+If `POST /v1/batch/jobs` returns an HTTP error after the input file was
+uploaded, the server tries to delete the uploaded file and the error says
+whether that cleanup succeeded. On a timeout or network error the job may
+exist, so the file is kept and the error gives its id for manual cleanup.
 
 ### Model parameters
 

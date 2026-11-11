@@ -154,18 +154,42 @@ function realpathNative(p) {
   return (fs.realpathSync.native || fs.realpathSync)(p);
 }
 
-const UNSAFE_SYSTEM_DIRS = ['/proc', '/sys', '/dev'];
+// Never approvable as roots, and files under them are never read (unsafe_path).
+const PSEUDO_FS_DIRS = ['/proc', '/sys', '/dev'];
+// Never approvable as roots, including their subdirectories.
+const SYSTEM_TREE_DIRS = ['/etc', '/root', '/boot'];
+// Never approvable as roots themselves; a root strictly under them (e.g. /var/www/app, /opt/project) is fine.
+const SYSTEM_EXACT_DIRS = ['/var', '/usr', '/opt', '/srv', '/bin', '/sbin', '/lib', '/lib64', '/run'];
+
+function isPseudoFsPath(real) {
+  return process.platform !== 'win32' && PSEUDO_FS_DIRS.some((d) => isInside(real, d));
+}
+
+let systemExactCache = null;
+function systemExactDirs() {
+  if (!systemExactCache) {
+    systemExactCache = new Set(SYSTEM_EXACT_DIRS);
+    // On merged-/usr systems /bin etc. are symlinks; refuse their canonical targets too.
+    for (const d of SYSTEM_EXACT_DIRS) { try { systemExactCache.add(realpathNative(d)); } catch { /* absent */ } }
+  }
+  return systemExactCache;
+}
 
 /**
  * Why a canonical directory may not be an approved root, or null if it may.
- * "/" and the home directory itself can be opted into (allowUnsafe); /proc, /sys, /dev never.
+ * System directories can never be approved. "/", the home directory itself and any
+ * directory that contains the home directory can be opted into (allowUnsafe).
  */
 function unsafeRootReason(real, homeReal, allowUnsafe) {
-  if (process.platform !== 'win32' && UNSAFE_SYSTEM_DIRS.some((d) => isInside(real, d))) {
-    return 'is inside a system pseudo-filesystem (/proc, /sys, /dev)';
+  if (process.platform !== 'win32') {
+    if (isPseudoFsPath(real)) return 'is inside a system pseudo-filesystem (/proc, /sys, /dev)';
+    if (SYSTEM_TREE_DIRS.some((d) => isInside(real, d))) return 'is inside a system directory (/etc, /root, /boot)';
+    if (systemExactDirs().has(real)) return 'is a system directory';
   }
-  if (path.parse(real).root === real) return allowUnsafe ? null : 'is the filesystem root';
-  if (homeReal && real === homeReal) return allowUnsafe ? null : 'is the home directory itself';
+  if (allowUnsafe) return null;
+  if (path.parse(real).root === real) return 'is the filesystem root';
+  if (homeReal && real === homeReal) return 'is the home directory itself';
+  if (homeReal && isInside(homeReal, real)) return 'contains the home directory';
   return null;
 }
 
@@ -264,8 +288,11 @@ const ENV_STAGE_NAME = /^env\.(local|dev|development|prod|production|staging|sta
 const HISTORY_NAME = /^\.?[a-z0-9_-]*_history$/;
 
 const CONTENT_RULES = [
-  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----/, 'contains a PEM/PGP private key'],
-  [/PuTTY-User-Key-File-/, 'contains a PuTTY private key'],
+  // Require key material, not just the marker, so files that merely quote the markers are allowed:
+  // a PEM/PGP header followed within ~200 chars by a run of 40+ base64 characters ...
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----[\s\S]{0,200}?[A-Za-z0-9+/=]{40,}/, 'contains a PEM/PGP private key'],
+  // ... and a PuTTY key file that actually has its private section.
+  [/PuTTY-User-Key-File-[\s\S]{0,8000}?Private-Lines[:]/, 'contains a PuTTY private key'],
   [/aws_secret_access_key["']?\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/i, 'contains an AWS secret access key'],
   [/(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/, 'contains an AWS access key id'],
 ];
@@ -307,9 +334,9 @@ function sensitiveContent(buf) {
 }
 
 /**
- * Validate one requested path against the sandbox. Returns { given, real, size, dev, ino }.
+ * Validate one requested path against the sandbox. Returns { given, real, lexical, size, dev, ino }.
  * Throws FileRejectedError with reason: outside_root | symlink_escape | sensitive |
- * not_regular_file | hard_link | too_large | not_found.
+ * not_regular_file | hard_link | too_large | not_found | unsafe_path.
  */
 function resolveSandboxedFile(given, cfg) {
   if (typeof given !== 'string' || given === '' || given.includes('\0')) {
@@ -332,9 +359,11 @@ function resolveSandboxedFile(given, cfg) {
   try {
     real = realpathNative(lexical);
   } catch {
+    if (isPseudoFsPath(lexical)) throw new FileRejectedError(given, 'unsafe_path', 'under /proc, /sys or /dev');
     if (!lexRoot) throw new FileRejectedError(given, 'outside_root');
     throw new FileRejectedError(given, 'not_found');
   }
+  if (isPseudoFsPath(real)) throw new FileRejectedError(given, 'unsafe_path', 'under /proc, /sys or /dev');
   const root = findRoot(real, cfg.roots, 'real');
   if (!root) {
     throw new FileRejectedError(given, lexRoot ? 'symlink_escape' : 'outside_root');
@@ -353,11 +382,11 @@ function resolveSandboxedFile(given, cfg) {
   if (st.size > cfg.maxFileBytes) {
     throw new FileRejectedError(given, 'too_large', `${st.size} bytes > per-file cap ${cfg.maxFileBytes}`);
   }
-  return { given, real, size: st.size, dev: st.dev, ino: st.ino };
+  return { given, real, lexical, size: st.size, dev: st.dev, ino: st.ino };
 }
 
 /** Open and read a checked entry, verifying the opened file is the one that was checked. */
-function readCheckedFile(entry, cfg) {
+function readCheckedFile(entry, cfg, { procFd = fs.existsSync('/proc/self/fd') } = {}) {
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   let fd;
   try {
@@ -375,13 +404,24 @@ function readCheckedFile(entry, cfg) {
     if (st.size > cfg.maxFileBytes) throw new FileRejectedError(entry.given, 'too_large');
     // Where the kernel exposes it, confirm where the open descriptor really points
     // (defends against a parent directory being swapped for a symlink after the check).
-    if (fs.existsSync('/proc/self/fd')) {
+    if (procFd) {
       let fdReal;
       try { fdReal = realpathNative(`/proc/self/fd/${fd}`); } catch { fdReal = null; }
       const fdRoot = fdReal ? findRoot(fdReal, cfg.roots, 'real') : null;
-      if (!fdRoot || sensitiveMatch(path.relative(fdRoot.real, fdReal))) {
+      if (!fdRoot || isPseudoFsPath(fdReal) || sensitiveMatch(path.relative(fdRoot.real, fdReal))) {
         throw new FileRejectedError(entry.given, 'changed_during_read', 'opened file is no longer an approved path');
       }
+    }
+    // Portable re-check (the only one where /proc/self/fd is unavailable): the path as
+    // requested must still resolve inside an approved root, to the very file that is open.
+    let again = null;
+    try {
+      const real2 = realpathNative(entry.lexical || entry.real);
+      const st2 = fs.statSync(real2);
+      if (st2.dev === st.dev && st2.ino === st.ino && findRoot(real2, cfg.roots, 'real') && !isPseudoFsPath(real2)) again = real2;
+    } catch { /* treated as changed */ }
+    if (!again) {
+      throw new FileRejectedError(entry.given, 'changed_during_read', 'path no longer resolves to the opened file inside an approved root');
     }
     const buf = Buffer.alloc(st.size);
     let off = 0;
@@ -577,6 +617,7 @@ class BillingBlockedError extends Error {
       `Response: ${String(body).slice(0, 300)}`,
     );
     this.code = 'MISTRAL_BILLING_402';
+    this.httpStatus = 402;
     this.retryable = false;
   }
 }
@@ -610,7 +651,11 @@ function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl
       clearTimeout(timer);
     }
     if (res.status === 402) throw new BillingBlockedError(method, pathname, text);
-    if (!res.ok) throw new Error(`Mistral API error ${res.status} on ${method} ${pathname}: ${text.slice(0, 1000)}`);
+    if (!res.ok) {
+      const err = new Error(`Mistral API error ${res.status} on ${method} ${pathname}: ${text.slice(0, 1000)}`);
+      err.httpStatus = res.status;
+      throw err;
+    }
     return text;
   }
 
@@ -672,7 +717,16 @@ function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl
         timeoutMs: 60000,
       });
     } catch (err) {
-      // Do not leave the uploaded input file orphaned: best-effort delete, and say how it went.
+      // Only an HTTP error response proves the server refused the job. On a timeout, abort,
+      // network error or unreadable response the job may exist, so the input file is kept.
+      if (!err || !err.httpStatus) {
+        if (err && typeof err.message === 'string') {
+          err.message += ` Job creation outcome is unknown; uploaded input file ${file.id} was NOT deleted because the job may exist. ` +
+            'Check the batch job list before deleting it manually.';
+        }
+        throw err;
+      }
+      // The job was refused: do not leave the uploaded input file orphaned.
       let cleaned = false;
       try {
         await apiFetch(`/files/${encodeURIComponent(file.id)}`, { method: 'DELETE', timeoutMs: 30000 });
@@ -959,6 +1013,7 @@ module.exports = {
   sensitiveMatch,
   sensitiveContent,
   unsafeRootReason,
+  isPseudoFsPath,
   readCheckedFile,
   resolveSandboxedFile,
   readFileContext,
