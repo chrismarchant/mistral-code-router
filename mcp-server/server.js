@@ -290,7 +290,11 @@ const HISTORY_NAME = /^\.?[a-z0-9_-]*_history$/;
 const CONTENT_RULES = [
   // Require key material, not just the marker, so files that merely quote the markers are allowed:
   // a PEM/PGP header followed within ~200 chars by a run of 40+ base64 characters ...
-  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----[\s\S]{0,200}?[A-Za-z0-9+/=]{40,}/, 'contains a PEM/PGP private key'],
+  // A marker alone is not enough (files may quote it). Key material must follow within 2000
+  // characters: either one run of 40+ base64 characters, or two consecutive lines that are
+  // pure base64 of 16+ characters each (keys wrapped at a narrow width). Line breaks may be
+  // real or JSON-escaped.
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----[\s\S]{0,2000}?(?:[A-Za-z0-9+/=]{40,}|(?:\n|\\n)[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*(?:\r|\\r)?(?:\n|\\n)[ \t]*[A-Za-z0-9+/=]{16,})/, 'contains a PEM/PGP private key'],
   // ... and a PuTTY key file that actually has its private section.
   [/PuTTY-User-Key-File-[\s\S]{0,8000}?Private-Lines[:]/, 'contains a PuTTY private key'],
   [/aws_secret_access_key["']?\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/i, 'contains an AWS secret access key'],

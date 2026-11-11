@@ -394,3 +394,18 @@ test('N5: marker-only text is allowed; real-looking keys are still refused', () 
   assert.match(String(sensitiveContent(utf16)), /PEM/);
   assert.match(String(sensitiveContent(Buffer.from(real.pem, 'utf16le').swap16())), /PEM/);
 });
+
+test('N5 follow-up: narrowly wrapped keys and long PGP headers are still refused; quoted markers are not', () => {
+  const begin = (label) => '-----BEGIN ' + label + '-----';
+  const line = (n) => 'QUJD'.repeat(Math.ceil(n / 4)).slice(0, n);
+  const narrow = `${begin('RSA PRIVATE KEY')}\n${line(30)}\n${line(30)}\n${line(30)}\n`;
+  assert.match(String(sensitiveContent(Buffer.from(narrow))), /PEM/, 'key wrapped at 30 characters');
+  const longHeaders = `${begin('PGP PRIVATE KEY BLOCK')}\nVersion: GnuPG v2\n` +
+    Array.from({ length: 8 }, (_, i) => `Comment: header line number ${i} with some padding text`).join('\n') +
+    `\n\n${line(64)}\n${line(64)}\n`;
+  assert.match(String(sensitiveContent(Buffer.from(longHeaders))), /PEM/, 'PGP block with long headers');
+  const escaped = JSON.stringify({ private_key: `${begin('PRIVATE KEY')}\n${line(30)}\n${line(30)}\n` });
+  assert.match(String(sensitiveContent(Buffer.from(escaped))), /PEM/, 'narrow key inside a JSON string');
+  const prose = `The scanner looks for ${begin('RSA PRIVATE KEY')} headers.\n\nThis paragraph is ordinary documentation text that follows the marker\nand continues for a few lines so that the rule has something to consider.\n`;
+  assert.strictEqual(sensitiveContent(Buffer.from(prose)), null, 'a quoted marker followed by prose');
+});
