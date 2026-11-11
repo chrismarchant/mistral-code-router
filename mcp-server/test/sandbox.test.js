@@ -24,7 +24,7 @@ test('file inside root is read', () => {
   const { root, cfg } = setup();
   write(path.join(root, 'src/a.js'), 'const a = 1;\n');
   const out = readFileContext(['src/a.js'], cfg);
-  assert.match(out, /<file path="src\/a.js">\nconst a = 1;/);
+  assert.match(out, /^<(file-[0-9a-f]{12}) path="src\/a.js">\nconst a = 1;\n\n<\/\1>$/);
   // absolute path inside root also fine
   assert.match(readFileContext([path.join(root, 'src/a.js')], cfg), /const a = 1/);
 });
@@ -119,7 +119,7 @@ test('PEM private key content is rejected without leaking content', () => {
   write(path.join(root, 'notes.md'), 'intro\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAASECRETMATERIAL\n-----END OPENSSH PRIVATE KEY-----\n');
   write(path.join(root, 'rsa.txt'), '-----BEGIN RSA PRIVATE KEY-----\nzzz\n');
   assert.throws(() => readFileContext(['notes.md'], cfg), (err) => {
-    assert.match(err.message, /"notes\.md" -> sensitive \(contains a PEM private key\)/);
+    assert.match(err.message, /"notes\.md" -> sensitive \(contains a PEM\/PGP private key\)/);
     assert.ok(!err.message.includes('SECRETMATERIAL'));
     return true;
   });
@@ -153,7 +153,7 @@ test('total context cap truncates and omits later files (but still validates the
   const out = readFileContext(['a.txt', 'b.txt', 'c.txt'], cfg);
   assert.match(out, /AAAAAAAA/);
   assert.match(out, /BB\n\.\.\. \[truncated by MAX_CONTEXT_CHARS\]/);
-  assert.match(out, /<file path="c.txt" omitted="MAX_CONTEXT_CHARS reached" \/>/);
+  assert.match(out, /<file-[0-9a-f]{12} path="c.txt" omitted="MAX_CONTEXT_CHARS reached" \/>/);
   assert.ok(!out.includes('CCC'));
   write(path.join(root, '.env'), 'X=1');
   rejects(() => readFileContext(['a.txt', 'b.txt', '.env'], cfg), '.env', 'sensitive');

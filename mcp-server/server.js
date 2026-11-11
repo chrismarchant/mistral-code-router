@@ -22,6 +22,8 @@
 const readline = require('node:readline');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+const crypto = require('node:crypto');
 
 /* ---------- Models ---------- */
 
@@ -54,8 +56,12 @@ const MODELS = {
 // pass parameters through unchanged.
 //   greedyRequiresTopP1: the API rejects temperature 0 unless top_p is 1
 //   ("top_p must be 1 when using greedy sampling", HTTP 400).
+// Lookup is by lowercased model ID. "mistral-large-4" is a known alias of Large 4.
+// "mistral-large-latest" is deliberately NOT listed: it resolves to a different model today.
+const LARGE_4_POLICY = { greedyRequiresTopP1: true };
 const MODEL_PARAM_POLICIES = {
-  'mistral-large-4-0': { greedyRequiresTopP1: true },
+  'mistral-large-4-0': LARGE_4_POLICY,
+  'mistral-large-4': LARGE_4_POLICY,
 };
 
 const DEFAULT_SYSTEM =
@@ -76,14 +82,14 @@ function resolveModel(alias) {
 function validateTemperature(t) {
   if (t === undefined || t === null) return undefined;
   if (typeof t !== 'number' || !Number.isFinite(t) || t < 0 || t > 2) {
-    throw new Error(`temperature must be a finite number in [0, 2] (got ${JSON.stringify(t)}).`);
+    throw new Error(`temperature must be a finite number in [0, 2] (got ${typeof t === 'number' ? String(t) : JSON.stringify(t)}).`);
   }
   return t;
 }
 
 /** Apply MODEL_PARAM_POLICIES to sampling params (mutates and returns body). */
 function applyModelParamPolicy(modelId, body) {
-  const policy = MODEL_PARAM_POLICIES[modelId];
+  const policy = MODEL_PARAM_POLICIES[String(modelId).toLowerCase()];
   if (!policy) return body;
   if (policy.greedyRequiresTopP1 && body.temperature === 0) body.top_p = 1;
   return body;
@@ -148,30 +154,62 @@ function realpathNative(p) {
   return (fs.realpathSync.native || fs.realpathSync)(p);
 }
 
-/** Canonicalise approved workspace roots: cwd + MISTRAL_ROUTER_ALLOWED_ROOTS (path-delimiter separated). */
-function canonicalRoots(cwd, extra, warn = () => {}) {
+const UNSAFE_SYSTEM_DIRS = ['/proc', '/sys', '/dev'];
+
+/**
+ * Why a canonical directory may not be an approved root, or null if it may.
+ * "/" and the home directory itself can be opted into (allowUnsafe); /proc, /sys, /dev never.
+ */
+function unsafeRootReason(real, homeReal, allowUnsafe) {
+  if (process.platform !== 'win32' && UNSAFE_SYSTEM_DIRS.some((d) => isInside(real, d))) {
+    return 'is inside a system pseudo-filesystem (/proc, /sys, /dev)';
+  }
+  if (path.parse(real).root === real) return allowUnsafe ? null : 'is the filesystem root';
+  if (homeReal && real === homeReal) return allowUnsafe ? null : 'is the home directory itself';
+  return null;
+}
+
+/**
+ * Canonicalise approved workspace roots: cwd + MISTRAL_ROUTER_ALLOWED_ROOTS (path-delimiter separated).
+ * Returns { roots, cwdError }. cwdError is set when the working directory is an unsafe root; the
+ * files parameter then fails closed. Unsafe extra roots are ignored (never approved).
+ */
+function canonicalRoots(cwd, extra, warn = () => {}, { homedir = os.homedir(), allowUnsafe = false } = {}) {
   const roots = [];
-  const add = (raw, label) => {
+  let cwdError = null;
+  let homeReal = null;
+  try { homeReal = homedir ? realpathNative(homedir) : null; } catch { /* no usable home */ }
+  const add = (raw, label, isCwd) => {
     try {
       const real = realpathNative(path.resolve(cwd, raw));
       if (!fs.statSync(real).isDirectory()) { warn(`${label} is not a directory; ignored.`); return; }
+      const unsafe = unsafeRootReason(real, homeReal, allowUnsafe);
+      if (unsafe) {
+        if (isCwd) cwdError = `the server working directory ${unsafe} and cannot be a workspace root`;
+        warn(`${label} ${unsafe}; refused as a workspace root.`);
+        return;
+      }
       if (!roots.some((r) => r.real === real)) roots.push({ raw: path.resolve(cwd, raw), real });
     } catch {
       warn(`${label} cannot be resolved; ignored.`);
     }
   };
-  add(cwd, 'working directory root');
+  add(cwd, 'working directory root', true);
   if (extra) {
     for (const r of String(extra).split(path.delimiter)) {
-      if (r.trim()) add(r.trim(), `MISTRAL_ROUTER_ALLOWED_ROOTS entry "${r.trim()}"`);
+      if (r.trim()) add(r.trim(), `MISTRAL_ROUTER_ALLOWED_ROOTS entry "${r.trim()}"`, false);
     }
   }
-  return roots;
+  return { roots, cwdError };
 }
 
-function loadConfig(env = process.env, cwd = process.cwd(), warn = () => {}) {
+function loadConfig(env = process.env, cwd = process.cwd(), warn = () => {}, { homedir } = {}) {
   const allowCustomBase = env.MISTRAL_ROUTER_ALLOW_CUSTOM_BASE === '1';
   const { base, error } = validateApiBase(env.MISTRAL_API_BASE, allowCustomBase);
+  const { roots, cwdError } = canonicalRoots(cwd, env.MISTRAL_ROUTER_ALLOWED_ROOTS, warn, {
+    homedir: homedir === undefined ? os.homedir() : homedir,
+    allowUnsafe: env.MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT === '1',
+  });
   return {
     apiBase: base,
     apiBaseError: error,
@@ -180,7 +218,8 @@ function loadConfig(env = process.env, cwd = process.cwd(), warn = () => {}) {
     maxContextChars: positiveInt(env.MAX_CONTEXT_CHARS, DEFAULT_MAX_CONTEXT_CHARS),
     maxFileBytes: positiveInt(env.MISTRAL_ROUTER_MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES),
     maxFiles: positiveInt(env.MISTRAL_ROUTER_MAX_FILES, DEFAULT_MAX_FILES),
-    roots: canonicalRoots(cwd, env.MISTRAL_ROUTER_ALLOWED_ROOTS, warn),
+    roots,
+    rootsError: cwdError,
   };
 }
 
@@ -204,16 +243,32 @@ function findRoot(p, roots, key) {
   return roots.find((r) => isInside(p, r[key])) || null;
 }
 
-const SENSITIVE_DIR_SEGMENTS = new Set(['.ssh', '.aws', '.gnupg', '.git', '.kube']);
+const SENSITIVE_DIR_SEGMENTS = new Set(['.ssh', '.aws', '.gnupg', '.git', '.kube', '.azure']);
+// Directory pairs: [parent, child]; child may be a directory or a file.
+const SENSITIVE_PAIRS = [
+  ['.docker', 'config.json'], ['gh', 'hosts.yml'], ['gh', 'hosts.yaml'], ['.config', 'gcloud'],
+];
 const SENSITIVE_BASENAMES = new Set([
-  '.netrc', '.npmrc', '.pypirc', '.claude.json', 'settings.local.json',
-  'credentials', 'credentials.json', '.git',
-  'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
-  'id_rsa.pub', 'id_dsa.pub', 'id_ecdsa.pub', 'id_ed25519.pub',
+  '.netrc', '_netrc', '.npmrc', '.pypirc', '.claude.json', 'settings.local.json',
+  'credentials', 'credentials.json', 'application_default_credentials.json', '.git',
+  '.git-credentials', '.pgpass', '.htpasswd', '.vault-token', '.dockercfg', '.my.cnf', '.s3cfg', '.boto',
+  'kubeconfig', '.histfile', '.lesshst', '.viminfo',
 ]);
-const SENSITIVE_EXTENSIONS = ['.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.tfstate', '.tfvars'];
+// Any dot-separated component of the basename (after the first) matching one of these is refused:
+// x.pem, k.pem.txt, server.key, a.key.bak, prod.tfvars.json, x.tfstate.backup, k.ppk ...
+const SENSITIVE_NAME_PARTS = new Set(['pem', 'key', 'p12', 'pfx', 'jks', 'keystore', 'ppk', 'tfstate', 'tfvars', 'kubeconfig']);
+const SSH_KEY_PREFIXES = ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'];
 const ENV_ALLOWED = new Set(['.env.example', '.env.sample', '.env.template']);
-const PEM_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
+const ENV_TEMPLATE_SUFFIX = /\.(example|sample|template)$/;
+const ENV_STAGE_NAME = /^env\.(local|dev|development|prod|production|staging|stage|test|secret|secrets)(\..*)?$/;
+const HISTORY_NAME = /^\.?[a-z0-9_-]*_history$/;
+
+const CONTENT_RULES = [
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----/, 'contains a PEM/PGP private key'],
+  [/PuTTY-User-Key-File-/, 'contains a PuTTY private key'],
+  [/aws_secret_access_key["']?\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/i, 'contains an AWS secret access key'],
+  [/(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/, 'contains an AWS access key id'],
+];
 
 /** Returns a reason string if the path (segments relative to its root) is sensitive, else null. */
 function sensitiveMatch(relPath) {
@@ -224,21 +279,37 @@ function sensitiveMatch(relPath) {
     if (SENSITIVE_DIR_SEGMENTS.has(s)) return `inside ${s}/`;
   }
   for (let i = 0; i < segs.length - 1; i++) {
-    if (segs[i] === '.docker' && segs[i + 1] === 'config.json') return '.docker/config.json';
+    if (SENSITIVE_PAIRS.some(([a, b]) => segs[i] === a && segs[i + 1] === b)) return `${segs[i]}/${segs[i + 1]}`;
   }
-  if (base === '.env' || (base.startsWith('.env.') && !ENV_ALLOWED.has(base))) return 'environment file';
+  // Environment files: .env, .env.*, .envrc, .env~, .env-prod, prod.env, a.env.local, env.local ...
+  if (!ENV_ALLOWED.has(base)) {
+    if (base.startsWith('.env') || base.endsWith('.env') || ENV_STAGE_NAME.test(base)
+      || (base.includes('.env.') && !ENV_TEMPLATE_SUFFIX.test(base))) return 'environment file';
+  }
   if (SENSITIVE_BASENAMES.has(base)) return `sensitive file name ${base}`;
+  if (SSH_KEY_PREFIXES.some((p) => base.startsWith(p))) return 'ssh key file';
   if (base.startsWith('secrets.')) return 'secrets file';
-  if (base.endsWith('.tfstate.backup')) return 'terraform state';
-  const ext = SENSITIVE_EXTENSIONS.find((e) => base.endsWith(e));
-  if (ext) return `sensitive extension ${ext}`;
+  if (HISTORY_NAME.test(base)) return 'shell history';
+  const part = base.split('.').slice(1).find((p) => SENSITIVE_NAME_PARTS.has(p));
+  if (part) return `sensitive name component .${part}`;
+  return null;
+}
+
+/** Returns a reason if file content looks like key material, else null. Never returns content. */
+function sensitiveContent(buf) {
+  const text = buf.toString('latin1');
+  // Second pass with NULs removed catches UTF-16 (LE/BE, with or without BOM) encodings of ASCII headers.
+  const candidates = text.includes('\0') ? [text, text.replace(/\0/g, '')] : [text];
+  for (const c of candidates) {
+    for (const [re, why] of CONTENT_RULES) if (re.test(c)) return why;
+  }
   return null;
 }
 
 /**
- * Validate one requested path against the sandbox. Returns { given, real, size }.
+ * Validate one requested path against the sandbox. Returns { given, real, size, dev, ino }.
  * Throws FileRejectedError with reason: outside_root | symlink_escape | sensitive |
- * not_regular_file | too_large | not_found.
+ * not_regular_file | hard_link | too_large | not_found.
  */
 function resolveSandboxedFile(given, cfg) {
   if (typeof given !== 'string' || given === '' || given.includes('\0')) {
@@ -276,24 +347,42 @@ function resolveSandboxedFile(given, cfg) {
   let st;
   try { st = fs.statSync(real); } catch { throw new FileRejectedError(given, 'not_found'); }
   if (!st.isFile()) throw new FileRejectedError(given, 'not_regular_file');
+  // Conservative: a hard link can alias a file that lives outside the roots, and the
+  // path alone cannot tell us, so any regular file with more than one link is refused.
+  if (st.nlink > 1) throw new FileRejectedError(given, 'hard_link', `${st.nlink} links`);
   if (st.size > cfg.maxFileBytes) {
     throw new FileRejectedError(given, 'too_large', `${st.size} bytes > per-file cap ${cfg.maxFileBytes}`);
   }
-  return { given, real, size: st.size };
+  return { given, real, size: st.size, dev: st.dev, ino: st.ino };
 }
 
+/** Open and read a checked entry, verifying the opened file is the one that was checked. */
 function readCheckedFile(entry, cfg) {
   const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
   let fd;
   try {
     fd = fs.openSync(entry.real, flags);
   } catch {
-    throw new FileRejectedError(entry.given, 'not_found', 'could not open');
+    throw new FileRejectedError(entry.given, 'changed_during_read', 'could not open the checked file');
   }
   try {
     const st = fs.fstatSync(fd);
+    if (st.dev !== entry.dev || st.ino !== entry.ino) {
+      throw new FileRejectedError(entry.given, 'changed_during_read', 'file identity changed after the check');
+    }
     if (!st.isFile()) throw new FileRejectedError(entry.given, 'not_regular_file');
+    if (st.nlink > 1) throw new FileRejectedError(entry.given, 'hard_link');
     if (st.size > cfg.maxFileBytes) throw new FileRejectedError(entry.given, 'too_large');
+    // Where the kernel exposes it, confirm where the open descriptor really points
+    // (defends against a parent directory being swapped for a symlink after the check).
+    if (fs.existsSync('/proc/self/fd')) {
+      let fdReal;
+      try { fdReal = realpathNative(`/proc/self/fd/${fd}`); } catch { fdReal = null; }
+      const fdRoot = fdReal ? findRoot(fdReal, cfg.roots, 'real') : null;
+      if (!fdRoot || sensitiveMatch(path.relative(fdRoot.real, fdReal))) {
+        throw new FileRejectedError(entry.given, 'changed_during_read', 'opened file is no longer an approved path');
+      }
+    }
     const buf = Buffer.alloc(st.size);
     let off = 0;
     while (off < st.size) {
@@ -301,11 +390,10 @@ function readCheckedFile(entry, cfg) {
       if (n === 0) break;
       off += n;
     }
-    const content = buf.subarray(0, off).toString('utf8');
-    if (PEM_PRIVATE_KEY_RE.test(content)) {
-      throw new FileRejectedError(entry.given, 'sensitive', 'contains a PEM private key');
-    }
-    return content;
+    const data = buf.subarray(0, off);
+    const why = sensitiveContent(data);
+    if (why) throw new FileRejectedError(entry.given, 'sensitive', why);
+    return data.toString('utf8');
   } finally {
     fs.closeSync(fd);
   }
@@ -323,6 +411,10 @@ function readFileContext(files, cfg) {
   if (files === undefined || files === null) return '';
   if (!Array.isArray(files)) throw new Error('files must be an array of path strings.');
   if (files.length === 0) return '';
+  if (cfg.rootsError) {
+    throw new Error(`File context rejected (no request sent): ${cfg.rootsError} -> unsafe_root. ` +
+      'Start the server in a project directory to use "files"; other tools and inline "context" still work.');
+  }
   if (files.length > cfg.maxFiles) {
     throw new Error(`File context rejected (no request sent): ${files.length} files requested > cap ${cfg.maxFiles} (MISTRAL_ROUTER_MAX_FILES) -> too_many_files.`);
   }
@@ -343,18 +435,22 @@ function readFileContext(files, cfg) {
   }
   if (rejected.length) throw fail();
 
+  // Per-call random tag name so file content cannot forge a closing delimiter.
+  let tag;
+  do { tag = `file-${crypto.randomBytes(6).toString('hex')}`; } while (contents.some((c) => c.includes(tag)));
+
   const parts = [];
   let remaining = cfg.maxContextChars;
   entries.forEach((e, i) => {
     const attr = escapeAttr(e.given);
     if (remaining <= 0) {
-      parts.push(`<file path="${attr}" omitted="MAX_CONTEXT_CHARS reached" />`);
+      parts.push(`<${tag} path="${attr}" omitted="MAX_CONTEXT_CHARS reached" />`);
       return;
     }
     let content = contents[i];
     if (content.length > remaining) content = content.slice(0, remaining) + '\n... [truncated by MAX_CONTEXT_CHARS]';
     remaining -= Math.min(contents[i].length, remaining);
-    parts.push(`<file path="${attr}">\n${content}\n</file>`);
+    parts.push(`<${tag} path="${attr}">\n${content}\n</${tag}>`);
   });
   return parts.join('\n\n');
 }
@@ -485,8 +581,8 @@ class BillingBlockedError extends Error {
   }
 }
 
-function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl = globalThis.fetch, warn } = {}) {
-  const cfg = loadConfig(env, cwd, warn);
+function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl = globalThis.fetch, warn, homedir } = {}) {
+  const cfg = loadConfig(env, cwd, warn, { homedir });
 
   async function apiFetch(pathname, { method = 'GET', jsonBody, formData, timeoutMs = 120000 } = {}) {
     if (cfg.apiBaseError) throw new Error(cfg.apiBaseError);
@@ -506,7 +602,7 @@ function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl
         headers['Content-Type'] = 'application/json';
         body = JSON.stringify(jsonBody);
       }
-      res = await fetchImpl(`${cfg.apiBase}${pathname}`, { method, headers, body, signal: ctrl.signal });
+      res = await fetchImpl(`${cfg.apiBase}${pathname}`, { method, headers, body, signal: ctrl.signal, redirect: 'error' });
       text = await res.text();
     } catch (err) {
       throw new Error(`Mistral API request failed: ${err && err.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : (err && err.message)}`);
@@ -562,17 +658,31 @@ function createRouter({ env = process.env, cwd = process.cwd(), fetch: fetchImpl
     if (!file || !file.id) throw new Error('File upload succeeded but returned no file id; batch job not created.');
 
     // 2. Create the batch job against the chat completions endpoint.
-    const job = await apiJson('/batch/jobs', {
-      method: 'POST',
-      jsonBody: {
-        input_files: [file.id],
-        endpoint: '/v1/chat/completions',
-        model: modelId,
-        timeout_hours: timeoutHours,
-        metadata: { source: 'mistral-router', requests: String(lines.length) },
-      },
-      timeoutMs: 60000,
-    });
+    let job;
+    try {
+      job = await apiJson('/batch/jobs', {
+        method: 'POST',
+        jsonBody: {
+          input_files: [file.id],
+          endpoint: '/v1/chat/completions',
+          model: modelId,
+          timeout_hours: timeoutHours,
+          metadata: { source: 'mistral-router', requests: String(lines.length) },
+        },
+        timeoutMs: 60000,
+      });
+    } catch (err) {
+      // Do not leave the uploaded input file orphaned: best-effort delete, and say how it went.
+      let cleaned = false;
+      try {
+        await apiFetch(`/files/${encodeURIComponent(file.id)}`, { method: 'DELETE', timeoutMs: 30000 });
+        cleaned = true;
+      } catch { /* reported below */ }
+      err.message += cleaned
+        ? ` Uploaded input file ${file.id} was deleted (cleanup succeeded).`
+        : ` Cleanup FAILED: uploaded input file ${file.id} was not deleted; remove it manually.`;
+      throw err;
+    }
 
     return JSON.stringify({
       job_id: job.id,
@@ -847,6 +957,9 @@ module.exports = {
   canonicalRoots,
   loadConfig,
   sensitiveMatch,
+  sensitiveContent,
+  unsafeRootReason,
+  readCheckedFile,
   resolveSandboxedFile,
   readFileContext,
   buildChatBody,

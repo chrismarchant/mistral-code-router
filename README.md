@@ -123,6 +123,7 @@ accepted as `model`.
 | `MISTRAL_ROUTER_ALLOW_CUSTOM_BASE` | unset | set to `1` to allow any http(s) `MISTRAL_API_BASE` |
 | `MAX_CONTEXT_CHARS` | `200000` | cap on total file context characters per request |
 | `MISTRAL_ROUTER_ALLOWED_ROOTS` | unset | extra workspace roots for `files`, separated by `:` (`;` on Windows) |
+| `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT` | unset | set to `1` to allow `/` or the home directory itself as a root |
 | `MISTRAL_ROUTER_MAX_FILE_BYTES` | `524288` | per-file size cap (512 KiB), checked before reading |
 | `MISTRAL_ROUTER_MAX_FILES` | `50` | maximum number of entries in `files` |
 
@@ -132,34 +133,73 @@ The `files` parameter reads local files and sends their contents to the API, so
 it is sandboxed and **fails closed**: if any requested path is rejected, the
 whole call fails before any request is sent. The error names each path as given
 and the reason (`outside_root`, `symlink_escape`, `sensitive`,
-`not_regular_file`, `too_large`, `not_found`, or `too_many_files`); file
-contents are never included in errors.
+`not_regular_file`, `hard_link`, `too_large`, `not_found`,
+`changed_during_read`, `too_many_files`, or `unsafe_root`); file contents are
+never included in errors.
 
 - **Approved roots.** The server's working directory, plus any directories in
   `MISTRAL_ROUTER_ALLOWED_ROOTS`. Roots are canonicalised (`realpath`) at
   startup; entries that do not exist are ignored with a warning on stderr.
+- **Unsafe roots.** The filesystem root `/`, the home directory itself, and
+  anything equal to or under `/proc`, `/sys` or `/dev` are never approved. If
+  the working directory is one of these, every call that passes `files` fails
+  with `unsafe_root`; other tools and inline `context` keep working. An unsafe
+  entry in `MISTRAL_ROUTER_ALLOWED_ROOTS` is ignored. Subdirectories of home
+  are fine. `MISTRAL_ROUTER_ALLOW_UNSAFE_ROOT=1` opts in `/` and the home
+  directory only; `/proc`, `/sys` and `/dev` cannot be opted in.
 - **Canonical resolution.** Every path is resolved with `realpath` (symlinks
   followed) and must land inside an approved root (`path.relative`
   containment, so `/x/root-evil` is not inside `/x/root`). A symlink inside a
   root that points outside is rejected as `symlink_escape`. Only regular files
   are read: no directories, devices, FIFOs, globbing or traversal.
-- **Sensitive exclusions** (on the canonical path and on the path as requested,
-  even inside a root): `.env` and `.env.*` (except `.env.example`,
-  `.env.sample`, `.env.template`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`,
-  `*.keystore`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519` (and `.pub`),
-  anything under `.ssh/`, `.aws/`, `.gnupg/`, `.git/`, `.kube/`,
-  `.docker/config.json`, `.netrc`, `.npmrc`, `.pypirc`, `credentials`,
-  `credentials.json`, `secrets.*`, `*.tfstate`, `*.tfvars`,
-  `settings.local.json` (anywhere, including `.claude/`), `.claude.json`.
-  Files whose content contains a PEM private-key header
-  (`-----BEGIN ... PRIVATE KEY-----`) are also refused.
+- **Hard links.** Any regular file with more than one link is rejected
+  (`hard_link`). This is deliberately conservative: a hard link can alias a
+  file outside the roots and the path cannot show it, so legitimately
+  hard-linked files (some package-manager stores) must be passed as inline
+  `context` instead.
+- **Read-time verification.** After opening, the file's device and inode must
+  match what was checked, and on Linux the open descriptor's real path
+  (`/proc/self/fd`) must still be inside an approved root; otherwise the read
+  is rejected as `changed_during_read`.
+- **Sensitive names** (matched case-insensitively on the canonical path and on
+  the path as requested, even inside a root):
+  - environment files: `.env*` (`.env`, `.env.local`, `.envrc`, `.env~`,
+    `.env-prod`), `*.env`, `*.env.*`, `env.local`/`env.prod`/... — except
+    `.env.example`, `.env.sample`, `.env.template`;
+  - key material: any name with a `.pem`, `.key`, `.p12`, `.pfx`, `.jks`,
+    `.keystore` or `.ppk` component (`x.pem`, `k.pem.txt`, `server.key.bak`),
+    and any name starting with `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519`;
+  - directories: `.ssh/`, `.aws/`, `.azure/`, `.gnupg/`, `.git/`, `.kube/`,
+    `.config/gcloud/`;
+  - credentials files: `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`,
+    `.pgpass`, `.htpasswd`, `.vault-token`, `.dockercfg`,
+    `.docker/config.json`, `.config/gh/hosts.yml`, `.my.cnf`, `.s3cfg`,
+    `.boto`, `credentials`, `credentials.json`,
+    `application_default_credentials.json`, `kubeconfig`, `*.kubeconfig`,
+    `secrets.*`;
+  - Terraform: any name with a `.tfstate` or `.tfvars` component
+    (`terraform.tfvars.json`, `x.tfstate.backup`);
+  - Claude settings: `settings.local.json` (anywhere), `.claude.json`;
+  - shell and REPL history: `*_history` (`.bash_history`, `.zsh_history`,
+    `.python_history`), `.histfile`, `.lesshst`, `.viminfo`.
+- **Sensitive content.** A file is refused if it contains a PEM or PGP
+  private-key header (`-----BEGIN ... PRIVATE KEY-----`, with or without
+  `BLOCK`, including UTF-16 encodings), a PuTTY key header
+  (`PuTTY-User-Key-File-`), an `aws_secret_access_key` assignment with a
+  40-character value, or an AWS access key id (`AKIA` + 16 characters). These
+  checks are a backstop, not a general secret scanner: do not rely on them to
+  catch arbitrary tokens.
+- **Delimiters.** File contents are wrapped in a per-call random tag
+  (`<file-<12 hex> path="...">`), so file content cannot forge a closing tag.
 - **Limits.** Per-file byte cap (checked via `stat` before reading), file-count
   cap, and the total `MAX_CONTEXT_CHARS` cap (later files are truncated or
   marked `omitted`).
 - **Base-URL allowlist.** The bearer key is only sent to
   `https://api.mistral.ai`. Any other `MISTRAL_API_BASE` makes every API tool
   call fail with a clear error unless `MISTRAL_ROUTER_ALLOW_CUSTOM_BASE=1`.
-  API error bodies are truncated in tool errors; the key is never logged.
+  Every request sets `redirect: 'error'`, so the `Authorization` header never
+  follows a redirect. API error bodies are truncated in tool errors; the key
+  is never logged.
 
 ### Batch billing (HTTP 402)
 
@@ -167,11 +207,16 @@ An HTTP 402 from any endpoint (commonly `POST /v1/batch/jobs`) is reported as
 an account-level billing blocker, not a software fault. Do not retry; resolve
 billing or credits for the key in the Mistral console first.
 
+If creating the job fails after the input file was uploaded, the server tries
+to delete the uploaded file and the error says whether that cleanup succeeded.
+
 ### Model parameters
 
 - `temperature` must be a finite number in `[0, 2]`.
-- `mistral-large-4-0` (`lechonk`) rejects greedy sampling unless `top_p` is 1,
-  so `temperature: 0` automatically sends `top_p: 1` for that model. Rules live
+- `mistral-large-4-0` (`lechonk`) and its alias `mistral-large-4` reject greedy
+  sampling unless `top_p` is 1, so `temperature: 0` automatically sends
+  `top_p: 1` for them (matched case-insensitively). `mistral-large-latest` is
+  left alone because it resolves to a different model today. Rules live
   in `MODEL_PARAM_POLICIES` in `server.js`; other models and raw IDs pass
   parameters through unchanged.
 - GLM and Large 4 can return `message.content` as blocks (`thinking` then

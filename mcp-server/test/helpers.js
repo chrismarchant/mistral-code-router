@@ -26,7 +26,7 @@ function fakeFetch(routes) {
   const calls = [];
   const fn = async (url, init = {}) => {
     const method = init.method || 'GET';
-    calls.push({ url, method, body: init.body, hasAuth: Boolean(init.headers && init.headers.Authorization) });
+    calls.push({ url, method, body: init.body, hasAuth: Boolean(init.headers && init.headers.Authorization), redirect: init.redirect });
     const route = routes.find((r) => (r.method || 'GET') === method && r.match(url));
     if (!route) throw new Error(`unexpected fetch ${method} ${url}`);
     const status = route.status || 200;
